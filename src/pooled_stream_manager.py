@@ -455,7 +455,7 @@ class SharedTranscodingProcess:
         """Add a client to this shared process and return their queue"""
         async with self._broadcaster_lock:
             # Create a queue for this client (max 100 chunks buffered)
-            client_queue = asyncio.Queue(maxsize=100)
+            client_queue = asyncio.Queue(maxsize=settings.CHANGE_BUFFER_CHUNKS)
             self.client_queues[client_id] = client_queue
             self.clients[client_id] = time.time()
             self.last_access = time.time()
@@ -960,14 +960,15 @@ class PooledStreamManager:
         reuse_stream_key: Optional[str] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
         """Get existing shared stream or create new one
-        
+
         Args:
             reuse_stream_key: If provided, reuse this stream key instead of generating a new one.
                               This is useful for failover scenarios where we want to maintain the
                               same stream key even though the URL has changed.
         """
 
-        stream_key = reuse_stream_key or self._generate_stream_key(url, profile)
+        stream_key = reuse_stream_key or self._generate_stream_key(
+            url, profile)
 
         # Track the stream_id -> stream_key mapping for event emission
         if stream_id:
@@ -982,8 +983,9 @@ class PooledStreamManager:
 
             # Check if URL has changed (failover scenario) or if process has failed
             url_changed = process.url != url
-            process_failed = process.status == "failed" or (process.process and process.process.returncode is not None)
-            
+            process_failed = process.status == "failed" or (
+                process.process and process.process.returncode is not None)
+
             if url_changed or process_failed:
                 if url_changed:
                     logger.info(
