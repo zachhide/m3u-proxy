@@ -476,6 +476,17 @@ class BroadcastManager:
                     # Force discontinuity on transition
                     config.add_discontinuity = True
 
+                # Remove the old playlist file to prevent stale content during transition
+                # FFmpeg won't update the playlist until it writes the first new segment,
+                # so we need to clear it to avoid serving stale segment references
+                old_playlist = os.path.join(self.hls_base_dir, f"broadcast_{network_id}", "live.m3u8")
+                if os.path.exists(old_playlist):
+                    try:
+                        os.remove(old_playlist)
+                        logger.debug(f"Removed old playlist during transition: {old_playlist}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove old playlist: {e}")
+
                 del self.broadcasts[network_id]
 
             # Create and start new process
