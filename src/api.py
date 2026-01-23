@@ -21,6 +21,7 @@ from config import settings, VERSION
 from transcoding import get_profile_manager, TranscodingProfileManager
 from redis_config import get_redis_config, should_use_pooling
 from hwaccel import hw_accel
+from broadcast_manager import BroadcastManager, BroadcastConfig, BroadcastStatus
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -337,6 +338,7 @@ enable_pooling = should_use_pooling()
 stream_manager = StreamManager(
     redis_url=redis_url, enable_pooling=enable_pooling)
 event_manager = EventManager()
+broadcast_manager = BroadcastManager()
 
 
 @asynccontextmanager
@@ -364,6 +366,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("m3u proxy shutting down...")
+    await broadcast_manager.shutdown()
     await stream_manager.stop()
     await event_manager.stop()
 
@@ -1998,6 +2001,230 @@ async def test_webhook(webhook_url: str = Query(..., description="Webhook URL to
     except Exception as e:
         logger.error(f"Error testing webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# Network Broadcast Endpoints
+# ============================================================================
+
+
+class BroadcastStartRequest(BaseModel):
+    """Request model for starting a network broadcast."""
+    stream_url: str
+    seek_seconds: int = 0
+    duration_seconds: int = 0  # 0 = unlimited
+    segment_start_number: int = 0
+    add_discontinuity: bool = False
+    segment_duration: int = 6
+    hls_list_size: int = 20
+    transcode: bool = False
+    video_bitrate: Optional[str] = None
+    audio_bitrate: int = 192
+    video_resolution: Optional[str] = None
+    callback_url: Optional[str] = None
+
+    @field_validator('stream_url')
+    @classmethod
+    def validate_stream_url(cls, v):
+        return validate_url(v)
+
+    @field_validator('callback_url')
+    @classmethod
+    def validate_callback_url(cls, v):
+        if v is not None:
+            return validate_url(v)
+        return v
+
+
+class BroadcastStatusResponse(BaseModel):
+    """Response model for broadcast status."""
+    network_id: str
+    status: str
+    current_segment_number: int
+    started_at: Optional[str]
+    stream_url: str
+    ffmpeg_pid: Optional[int] = None
+    error_message: Optional[str] = None
+
+
+@app.post("/broadcast/{network_id}/start", dependencies=[Depends(verify_token)])
+async def start_broadcast(
+    network_id: str,
+    request: BroadcastStartRequest
+) -> BroadcastStatusResponse:
+    """
+    Start or transition a network broadcast.
+
+    If a broadcast is already running for this network, it will be stopped
+    gracefully and the new broadcast will continue with proper segment numbering.
+
+    The FFmpeg process will run with a duration limit (-t flag) to stop at
+    the programme boundary. When FFmpeg exits, a webhook callback is sent
+    to the callback_url if provided.
+    """
+    try:
+        config = BroadcastConfig(
+            network_id=network_id,
+            stream_url=request.stream_url,
+            seek_seconds=request.seek_seconds,
+            duration_seconds=request.duration_seconds,
+            segment_start_number=request.segment_start_number,
+            add_discontinuity=request.add_discontinuity,
+            segment_duration=request.segment_duration,
+            hls_list_size=request.hls_list_size,
+            transcode=request.transcode,
+            video_bitrate=request.video_bitrate,
+            audio_bitrate=request.audio_bitrate,
+            video_resolution=request.video_resolution,
+            callback_url=request.callback_url
+        )
+        status = await broadcast_manager.start_broadcast(config)
+        return BroadcastStatusResponse(
+            network_id=status.network_id,
+            status=status.status,
+            current_segment_number=status.current_segment_number,
+            started_at=status.started_at,
+            stream_url=status.stream_url,
+            ffmpeg_pid=status.ffmpeg_pid,
+            error_message=status.error_message
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error starting broadcast {network_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/broadcast/{network_id}/stop", dependencies=[Depends(verify_token)])
+async def stop_broadcast(network_id: str) -> dict:
+    """
+    Stop a network broadcast.
+
+    Gracefully terminates the FFmpeg process and returns the final segment number
+    for use in subsequent broadcasts.
+    """
+    try:
+        status = await broadcast_manager.stop_broadcast(network_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="Broadcast not found")
+        return {
+            "message": "Broadcast stopped",
+            "network_id": network_id,
+            "final_segment_number": status.current_segment_number,
+            "status": status.status
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error stopping broadcast {network_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/broadcast/{network_id}/live.m3u8")
+async def get_broadcast_playlist(network_id: str) -> Response:
+    """
+    Serve the HLS playlist for a network broadcast.
+
+    Returns the live.m3u8 playlist file with appropriate headers for
+    HLS streaming compatibility.
+    """
+    content = await broadcast_manager.read_playlist(network_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Playlist not available")
+    return Response(
+        content=content,
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
+
+
+@app.get("/broadcast/{network_id}/segment/{filename}")
+async def get_broadcast_segment(network_id: str, filename: str) -> FileResponse:
+    """
+    Serve a segment file for a network broadcast.
+
+    Segments are served with caching headers since they are immutable
+    once created.
+    """
+    segment_path = broadcast_manager.get_segment_path(network_id, filename)
+    if segment_path is None or not os.path.exists(segment_path):
+        raise HTTPException(status_code=404, detail="Segment not found")
+    return FileResponse(
+        segment_path,
+        media_type="video/MP2T",
+        headers={
+            "Cache-Control": "max-age=86400",  # Segments are immutable
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
+
+
+@app.get("/broadcast/{network_id}/status", dependencies=[Depends(verify_token)])
+async def get_broadcast_status(network_id: str) -> BroadcastStatusResponse:
+    """
+    Get current broadcast status for a network.
+
+    Returns information about the running FFmpeg process including
+    PID, current segment number, and any error messages.
+    """
+    status = broadcast_manager.get_status(network_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Broadcast not found")
+    return BroadcastStatusResponse(
+        network_id=status.network_id,
+        status=status.status,
+        current_segment_number=status.current_segment_number,
+        started_at=status.started_at,
+        stream_url=status.stream_url,
+        ffmpeg_pid=status.ffmpeg_pid,
+        error_message=status.error_message
+    )
+
+
+@app.get("/broadcast", dependencies=[Depends(verify_token)])
+async def list_broadcasts() -> dict:
+    """
+    List all active broadcasts with their current status.
+    """
+    statuses = broadcast_manager.get_all_statuses()
+    return {
+        "broadcasts": [
+            {
+                "network_id": status.network_id,
+                "status": status.status,
+                "current_segment_number": status.current_segment_number,
+                "started_at": status.started_at,
+                "stream_url": status.stream_url,
+                "ffmpeg_pid": status.ffmpeg_pid
+            }
+            for status in statuses.values()
+        ],
+        "count": len(statuses)
+    }
+
+
+@app.delete("/broadcast/{network_id}", dependencies=[Depends(verify_token)])
+async def cleanup_broadcast(network_id: str) -> dict:
+    """
+    Stop broadcast and clean up all files for a network.
+
+    This removes the broadcast directory and all segment files.
+    Use this when a network is deleted or when you want a fresh start.
+    """
+    try:
+        success = await broadcast_manager.cleanup_broadcast(network_id)
+        if success:
+            return {"message": f"Broadcast {network_id} cleaned up successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to clean up broadcast")
+    except Exception as e:
+        logger.error(f"Error cleaning up broadcast {network_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Event Handler Examples
 # Custom event handlers are now set up in the lifespan context manager above

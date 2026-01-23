@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     # before considering the transcoder failed and cleaning it up.
     HLS_WAIT_TIME: int = 10
 
+    # Network Broadcast Configuration
+    # Base directory for broadcast HLS output. Each network gets a subdirectory.
+    HLS_BROADCAST_DIR: str = "/tmp/m3u-proxy-broadcasts"
+    # Timeout (seconds) for webhook callbacks to Laravel when broadcasts end
+    BROADCAST_CALLBACK_TIMEOUT: int = 10
+
     # API Authentication
     API_TOKEN: Optional[str] = None
 
