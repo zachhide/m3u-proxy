@@ -99,8 +99,10 @@ class Settings(BaseSettings):
     # Network Broadcast Configuration
     # Base directory for broadcast HLS output. Each network gets a subdirectory.
     HLS_BROADCAST_DIR: str = "/tmp/m3u-proxy-broadcasts"
-    # Timeout (seconds) for webhook callbacks to Laravel when broadcasts end
-    BROADCAST_CALLBACK_TIMEOUT: int = 10
+    # Timeout (seconds) for webhook callbacks to the broadcast creator when broadcasts end
+    BROADCAST_CALLBACK_TIMEOUT: int = 3
+    BROADCAST_START_RETRY_WINDOW: float = 300.0  # seconds
+    BROADCAST_START_FAILURE_GRACE: float = 2.0  # seconds
 
     # API Authentication
     API_TOKEN: Optional[str] = None
