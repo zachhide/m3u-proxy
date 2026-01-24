@@ -464,6 +464,18 @@ class BroadcastManager:
         self.broadcasts: Dict[str, NetworkBroadcastProcess] = {}
         self._lock = asyncio.Lock()
 
+        # Start attempt tracking (avoid infinite restart loops)
+        # Map network_id -> {count: int, first_attempt_at: float}
+        self._start_attempts: Dict[str, dict] = {}
+
+        # Configuration (can be overridden via settings)
+        self.MAX_START_RETRIES = int(
+            getattr(settings, 'BROADCAST_MAX_START_RETRIES', 3))
+        self.START_RETRY_WINDOW = float(
+            getattr(settings, 'BROADCAST_START_RETRY_WINDOW', 300.0))
+        self.START_FAILURE_GRACE = float(
+            getattr(settings, 'BROADCAST_START_FAILURE_GRACE', 2.0))
+
         # Ensure base directory exists
         os.makedirs(self.hls_base_dir, exist_ok=True)
         logger.info(
@@ -503,13 +515,70 @@ class BroadcastManager:
 
             # Create and start new process
             process = NetworkBroadcastProcess(config, self.hls_base_dir)
+
+            # Check start retry policy
+            now = time.time()
+            attempts = self._start_attempts.get(network_id)
+            if attempts:
+                # reset window if expired
+                if now - attempts.get('first_attempt_at', now) > self.START_RETRY_WINDOW:
+                    attempts = None
+                    del self._start_attempts[network_id]
+
+            if attempts and attempts.get('count', 0) >= self.MAX_START_RETRIES:
+                logger.error(
+                    f"Exceeded max start retries ({self.MAX_START_RETRIES}) for broadcast {network_id}; refusing to start until manual intervention.")
+                raise RuntimeError(
+                    f"Exceeded max start retries for broadcast {network_id}")
+
             success = await process.start()
 
             if not success:
+                # Record failure immediately
+                at = self._start_attempts.setdefault(
+                    network_id, {'count': 0, 'first_attempt_at': now})
+                at['count'] += 1
+                logger.warning(
+                    f"Start attempt {at['count']} failed for {network_id}: {process.error_message}")
                 raise RuntimeError(
                     f"Failed to start broadcast: {process.error_message}")
 
+            # Add to active broadcasts and give a short grace period to detect immediate failures
             self.broadcasts[network_id] = process
+
+            # Wait a small grace period to detect immediate startup failures (e.g., input errors)
+            try:
+                await asyncio.sleep(self.START_FAILURE_GRACE)
+            except asyncio.CancelledError:
+                pass
+
+            # If process already failed within the grace period, treat as a start failure
+            if process.status == 'failed' or (process.process and process.process.returncode is not None and process.process.returncode != 0):
+                at = self._start_attempts.setdefault(
+                    network_id, {'count': 0, 'first_attempt_at': now})
+                at['count'] += 1
+                logger.warning(
+                    f"Start attempt {at['count']} failed (post-start) for {network_id}: {process.error_message}")
+
+                # Clean up the failed process to avoid stale entries
+                try:
+                    await process.stop(graceful=False)
+                except Exception:
+                    pass
+                if network_id in self.broadcasts:
+                    del self.broadcasts[network_id]
+
+                # If we've exceeded attempts, log an error
+                if at['count'] >= self.MAX_START_RETRIES:
+                    logger.error(
+                        f"Exceeded max start retries ({self.MAX_START_RETRIES}) for broadcast {network_id}; refusing further automatic starts.")
+                raise RuntimeError(
+                    f"Broadcast {network_id} failed shortly after start: {process.error_message}")
+
+            # Successful start; clear any previous attempts
+            if network_id in self._start_attempts:
+                del self._start_attempts[network_id]
+
             return process.get_status()
 
     async def stop_broadcast(self, network_id: str) -> Optional[BroadcastStatus]:
@@ -523,6 +592,10 @@ class BroadcastManager:
 
             status = process.get_status()
             del self.broadcasts[network_id]
+
+            # Reset any tracked start attempts for this network since we stopped it manually
+            if network_id in self._start_attempts:
+                del self._start_attempts[network_id]
 
             return status
 
@@ -600,6 +673,9 @@ class BroadcastManager:
                     shutil.rmtree(broadcast_dir)
                     logger.info(
                         f"Cleaned up broadcast directory: {broadcast_dir}")
+                    # Clear start attempts on successful cleanup
+                    if network_id in self._start_attempts:
+                        del self._start_attempts[network_id]
                     return True
                 except Exception as e:
                     logger.error(
