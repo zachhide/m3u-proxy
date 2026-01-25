@@ -142,6 +142,12 @@ class NetworkBroadcastProcess:
                     f"Failed to construct headers for FFmpeg input: {e}")
                 cmd.extend(["-i", self.config.stream_url])
 
+        # If no input has been added by the header logic above, append it as a plain -i.
+        # This is a defensive measure to avoid malformed commands when headers are not
+        # provided and the URL is a simple network resource (e.g., Emby/Jellyfin stream.ts).
+        if "-i" not in cmd:
+            cmd.extend(["-i", self.config.stream_url])
+
         # Duration limiting for programme boundary
         if self.config.duration_seconds > 0:
             cmd.extend(["-t", str(self.config.duration_seconds)])
