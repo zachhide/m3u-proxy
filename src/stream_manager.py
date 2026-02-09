@@ -2028,6 +2028,14 @@ class StreamManager:
                 final_url = str(response.url)
                 stream_info.final_playlist_url = final_url
 
+                # STICKY SESSION HANDLER:
+                # If we followed a redirect, update current_url to the final URL.
+                # This ensures we stick to the specific backend origin for subsequent requests,
+                # preventing playback loops caused by non-monotonic sequence numbers when
+                # load balancers bounce between origins with different playlist states.
+                if current_url and final_url != current_url:
+                    stream_info.current_url = final_url
+
                 parsed_url = urlparse(final_url)
                 base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
                 if parsed_url.path:
@@ -2060,6 +2068,16 @@ class StreamManager:
                 logger.error(
                     f"Error fetching playlist for stream {stream_id}: {e}")
                 stream_info.error_count += 1
+
+                # STICKY SESSION RECOVERY:
+                # If we were stuck to a specific origin (via redirect) and it failed,
+                # revert to the configured URL to allow implicit load balancer failover.
+                known_urls = [stream_info.original_url] + \
+                    (stream_info.failover_urls or [])
+                if stream_info.current_url and stream_info.current_url not in known_urls:
+                    logger.warning(
+                        f"Sticky origin {stream_info.current_url} failed. Reverting to original configured entry point.")
+                    stream_info.current_url = None
 
                 # Try failover if available and not the last attempt
                 has_failovers = bool(
